@@ -20,8 +20,19 @@ function parseEmail(subject, body) {
   const text = `${subject || ''}\n${body || ''}`;
   const loanNumbers = [];
 
-  // Extract loan numbers
-  const loanPattern = /\b(?:loans?|deals?)\s*(?:number|#|no\.?|num\.?)?\s*:?\s*(\d{5,6})\b/gi;
+  // Check if email contains servicer keywords
+  const hasServicer = /\b(FCI|GLS)\b/i.test(text);
+
+  // Extract loan numbers - different patterns for servicer vs regular
+  let loanPattern;
+  if (hasServicer) {
+    // For FCI/GLS emails: allow longer loan numbers (5-10 digits)
+    loanPattern = /\b(?:loans?|deals?)\s*(?:number|#|no\.?|num\.?)?\s*:?\s*(\d{5,10})\b/gi;
+  } else {
+    // For regular emails: 5-6 digits only to avoid false positives
+    loanPattern = /\b(?:loans?|deals?)\s*(?:number|#|no\.?|num\.?)?\s*:?\s*(\d{5,6})\b/gi;
+  }
+
   let match;
   while ((match = loanPattern.exec(text)) !== null) {
     loanNumbers.push(match[1]);
@@ -30,7 +41,9 @@ function parseEmail(subject, body) {
   // Extract from subject line after RE:/FW:
   const lines = text.split('\n');
   if (lines.length > 0) {
-    const subjectPattern = /\b(?:RE:|FW:)\s*(\d{5})\b/gi;
+    const subjectPattern = hasServicer
+      ? /\b(?:RE:|FW:)\s*(\d{5,10})\b/gi  // Longer numbers for servicer emails
+      : /\b(?:RE:|FW:)\s*(\d{5,6})\b/gi;  // Standard 5-6 digits for regular
     while ((match = subjectPattern.exec(lines[0])) !== null) {
       loanNumbers.push(match[1]);
     }
@@ -38,12 +51,15 @@ function parseEmail(subject, body) {
 
   return {
     loanNumbers: [...new Set(loanNumbers)],
-    hasLoanNumber: loanNumbers.length > 0
+    hasLoanNumber: loanNumbers.length > 0,
+    hasServicer: hasServicer
   };
 }
 
 // Search deals by loan number
-async function searchDeals(apiKey, loanNumber) {
+async function searchDeals(apiKey, loanNumber, useServicerProperty = false) {
+  const propertyName = useServicerProperty ? 'loan_number__servicer_' : 'loan_number';
+
   const response = await fetch(`${HUBSPOT_API_BASE}/crm/v3/objects/deals/search`, {
     method: 'POST',
     headers: {
@@ -53,12 +69,12 @@ async function searchDeals(apiKey, loanNumber) {
     body: JSON.stringify({
       filterGroups: [{
         filters: [{
-          propertyName: 'loan_number',
+          propertyName: propertyName,
           operator: 'CONTAINS_TOKEN',
           value: loanNumber
         }]
       }],
-      properties: ['loan_number', 'dealname', 'dealstage'],
+      properties: ['loan_number', 'loan_number__servicer_', 'dealname', 'dealstage'],
       limit: 20
     })
   });
@@ -178,10 +194,13 @@ export async function handler(event) {
         }
 
         console.log(`Found loan numbers: ${parsed.loanNumbers.join(', ')}`);
+        if (parsed.hasServicer) {
+          console.log('Email contains FCI or GLS - searching by loan_number__servicer_');
+        }
 
         // Search for matching deals
         for (const loanNumber of parsed.loanNumbers) {
-          const deals = await searchDeals(apiKey, loanNumber);
+          const deals = await searchDeals(apiKey, loanNumber, parsed.hasServicer);
           const targetDeals = deals.filter(isTargetStage);
 
           if (targetDeals.length > 0) {
