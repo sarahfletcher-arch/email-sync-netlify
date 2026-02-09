@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Email Sync Integration</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 600px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 32px;
+        }
+
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 16px;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 15px;
+            background: #f0fdf4;
+            border: 2px solid #86efac;
+            border-radius: 10px;
+            margin-bottom: 30px;
+        }
+
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            background: #22c55e;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .info-box {
+            background: #f8fafc;
+            border-left: 4px solid #667eea;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 5px;
+        }
+
+        .info-box h3 {
+            color: #334155;
+            margin-bottom: 10px;
+            font-size: 18px;
+        }
+
+        .info-box ul {
+            list-style: none;
+            padding-left: 0;
+        }
+
+        .info-box li {
+            padding: 8px 0;
+            color: #64748b;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .info-box li:before {
+            content: "✓";
+            color: #22c55e;
+            font-weight: bold;
+            font-size: 18px;
+        }
+
+        .endpoint {
+            background: #1e293b;
+            color: #e2e8f0;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            margin-top: 10px;
+            overflow-x: auto;
+        }
+
+        button {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: background 0.3s;
+            width: 100%;
+            margin-top: 20px;
+        }
+
+        button:hover {
+            background: #5568d3;
+        }
+
+        #result {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 8px;
+            display: none;
+        }
+
+        #result.success {
+            background: #f0fdf4;
+            color: #166534;
+            border: 1px solid #86efac;
+            display: block;
+        }
+
+        #result.error {
+            background: #fef2f2;
+            color: #991b1b;
+            border: 1px solid #fca5a5;
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📧 Email Sync Integration</h1>
+        <p class="subtitle">Backflip Email-to-Deal Automation</p>
+
+        <div class="status">
+            <div class="status-dot"></div>
+            <span><strong>Status:</strong> Active and Running</span>
+        </div>
+
+        <div class="info-box">
+            <h3>What This Does</h3>
+            <ul>
+                <li>Automatically syncs emails to deals</li>
+                <li>Matches by loan number</li>
+                <li>Works with presentation, post-funded, and sold stages</li>
+                <li>Processes webhooks in real-time</li>
+            </ul>
+        </div>
+
+        <div class="info-box">
+            <h3>Webhook Endpoint</h3>
+            <p style="color: #64748b; margin-bottom: 10px;">Use this URL in HubSpot webhook settings:</p>
+            <div class="endpoint" id="webhookUrl">
+                Loading...
+            </div>
+        </div>
+
+        <button onclick="testWebhook()">Test Connection</button>
+
+        <div id="result"></div>
+    </div>
+
+    <script>
+        // Get the current URL and display webhook endpoint
+        const baseUrl = window.location.origin;
+        document.getElementById('webhookUrl').textContent = baseUrl + '/webhooks/email-sync';
+
+        async function testWebhook() {
+            const resultDiv = document.getElementById('result');
+            resultDiv.textContent = 'Testing connection...';
+            resultDiv.className = '';
+            resultDiv.style.display = 'block';
+
+            try {
+                const response = await fetch('/webhooks/email-sync/stats');
+                const data = await response.json();
+
+                if (response.ok) {
+                    resultDiv.className = 'success';
+                    resultDiv.innerHTML = `
+                        <strong>✓ Connection Successful!</strong><br>
+                        Status: ${data.status}<br>
+                        ${data.message}
+                    `;
+                } else {
+                    throw new Error('Connection failed');
+                }
+            } catch (error) {
+                resultDiv.className = 'error';
+                resultDiv.innerHTML = `
+                    <strong>✗ Connection Failed</strong><br>
+                    ${error.message}
+                `;
+            }
+        }
+    </script>
+</body>
+</html>

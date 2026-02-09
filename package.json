@@ -1,0 +1,9 @@
+{
+  "name": "email-sync-netlify",
+  "version": "1.0.0",
+  "description": "Email to Deal Sync Integration for Netlify",
+  "type": "module",
+  "dependencies": {
+    "node-fetch": "^3.3.0"
+  }
+}

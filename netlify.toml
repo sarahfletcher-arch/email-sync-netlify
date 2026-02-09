@@ -1,0 +1,16 @@
+[build]
+  functions = "netlify/functions"
+  publish = "public"
+
+[functions]
+  node_bundler = "esbuild"
+
+[[redirects]]
+  from = "/webhooks/email-sync"
+  to = "/.netlify/functions/email-sync"
+  status = 200
+
+[[redirects]]
+  from = "/webhooks/email-sync/stats"
+  to = "/.netlify/functions/email-sync-stats"
+  status = 200
