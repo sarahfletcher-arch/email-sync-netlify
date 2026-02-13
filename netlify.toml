@@ -14,3 +14,8 @@
   from = "/webhooks/email-sync/stats"
   to = "/.netlify/functions/email-sync-stats"
   status = 200
+
+[[redirects]]
+  from = "/webhooks/feasibility-summary"
+  to = "/.netlify/functions/feasibility-summary-background"
+  status = 200

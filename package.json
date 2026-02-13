@@ -1,9 +1,10 @@
 {
-  "name": "email-sync-netlify",
+  "name": "backflip-netlify-functions",
   "version": "1.0.0",
-  "description": "Email to Deal Sync Integration for Netlify",
+  "description": "Backflip Netlify Functions (Email Sync, Feasibility Summary)",
   "type": "module",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.30.0",
     "node-fetch": "^3.3.0"
   }
 }
