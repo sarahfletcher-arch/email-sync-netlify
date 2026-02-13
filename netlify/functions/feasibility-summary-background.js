@@ -296,25 +296,29 @@ export async function handler(event) {
     const events = JSON.parse(event.body);
     console.log(`Processing ${events.length} events`);
 
-    // Collect unique engagement IDs from note-related events
-    const engagementIds = new Set();
+    // Collect unique deal IDs from deal property change events
+    const dealIds = new Set();
     for (const evt of events) {
       const subType = evt.subscriptionType || '';
-      if (subType === 'engagement.creation' || subType === 'engagement.propertyChange') {
-        const eid = String(evt.objectId || '');
-        if (eid) engagementIds.add(eid);
+      if (subType === 'deal.propertyChange' || subType === 'deal.creation') {
+        const did = String(evt.objectId || '');
+        if (did) dealIds.add(did);
       }
     }
 
-    console.log(`Found ${engagementIds.size} unique engagement(s) to process`);
+    console.log(`Found ${dealIds.size} unique deal(s) to process`);
 
-    for (const eid of engagementIds) {
-      await processEngagement(eid);
+    for (const dealId of dealIds) {
+      try {
+        await processDeal(dealId);
+      } catch (err) {
+        console.error(`Failed to process deal ${dealId}:`, err.message);
+      }
     }
 
     return {
       statusCode: 200,
-      body: JSON.stringify({ success: true, processed: engagementIds.size }),
+      body: JSON.stringify({ success: true, processed: dealIds.size }),
     };
   } catch (error) {
     console.error('Error processing webhook:', error);
