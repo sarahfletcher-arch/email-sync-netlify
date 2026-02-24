@@ -5,8 +5,10 @@
  * Features:
  * - Deduplicates events within a batch
  * - Retries with backoff on rate limits (429)
- * - Matches by loan number, address, and deal name
- * - 95% confidence threshold
+ * - Matches by loan number (incl. 9-digit servicer numbers), address, and deal name
+ * - 65% confidence threshold (address matches score 80+)
+ * - Subject line pattern extraction (draws, payments, title work)
+ * - Cross-field search (dealname <-> full_address fallback)
  * - Fallback: if contact has exactly one deal, assumes that's the match
  * - Throttles API calls to stay within HubSpot limits
  */
@@ -16,15 +18,35 @@ import fetch from 'node-fetch';
 // HubSpot API base URL
 const HUBSPOT_API_BASE = 'https://api.hubapi.com';
 
-// Target deal stages
+// Target deal stages - any active/funded deal stage
 const TARGET_STAGES = {
-  presentationScheduled: 'presentationscheduled',
+  processing: 'presentationscheduled',
   postFunded: 'closedwon',
-  sold: '4447566'
+  sold: '4447566',
+  repaid: '4447567',
+  lienReleased: '1085330955',
+  dscrProcessing: '1067972413',
+  dscrPostCloseQC: '1067972416',
+  dscrClosedWon: '1269293461',
+  preForeclosure: '1015819060',
+  foreclosureActive: '1015819061',
+  foreclosurePaused: '1018320194',
+  foreclosureAuction: '1018320195',
+  reoPreListing: '1015819063',
+  reoListed: '1018320196',
+  reoUnderContract: '1018320197',
 };
+const TARGET_STAGE_VALUES = new Set(Object.values(TARGET_STAGES));
 
 // Minimum confidence to auto-associate
-const CONFIDENCE_THRESHOLD = 95;
+const CONFIDENCE_THRESHOLD = 65;
+
+// Address false-positive blacklist
+const ADDRESS_BLACKLIST = [
+  /^\d+\s+(am|pm|quick|other|of\b)/i,
+  /bankruptcy|unsubscribe|copyright/i,
+  /^\d+\s+\w+\s+to\s+get\s+started/i,
+];
 
 // --- HubSpot API helper with retry ---
 
@@ -74,90 +96,149 @@ function sleep(ms) {
 // --- Email parser ---
 
 function parseEmail(subject, body) {
-  const text = `${subject || ''}\n${body || ''}`;
+  const cleanSubject = (subject || '').trim();
+  const cleanBody = (body || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
   return {
-    loanNumbers: extractLoanNumbers(text),
-    addresses: extractAddresses(text),
-    dealNames: extractDealNames(text),
-    hasServicer: /\b(FCI|GLS)\b/i.test(text)
+    loanNumbers: extractLoanNumbers(cleanSubject, cleanBody),
+    addresses: extractAddresses(cleanSubject, cleanBody),
+    dealNames: extractDealNames(cleanSubject, cleanBody),
   };
 }
 
-function extractLoanNumbers(text) {
+function extractLoanNumbers(subject, body) {
+  const text = `${subject}\n${body}`;
   const loanNumbers = new Set();
-  const hasServicer = /\b(FCI|GLS)\b/i.test(text);
-
-  // Loan numbers with context keywords
-  const loanPattern = hasServicer
-    ? /\b(?:loans?|deals?)\s*(?:number|#|no\.?|num\.?)?\s*:?\s*(\d{5,10})\b/gi
-    : /\b(?:loans?|deals?)\s*(?:number|#|no\.?|num\.?)?\s*:?\s*(\d{5,6})\b/gi;
-
-  let match;
-  while ((match = loanPattern.exec(text)) !== null) {
-    loanNumbers.add(match[1]);
-  }
-
-  // Subject line after RE:/FW:
-  const lines = text.split('\n');
-  if (lines.length > 0) {
-    const subjectPattern = hasServicer
-      ? /\b(?:RE:|FW:)\s*(\d{5,10})\b/gi
-      : /\b(?:RE:|FW:)\s*(\d{5,6})\b/gi;
-    while ((match = subjectPattern.exec(lines[0])) !== null) {
-      loanNumbers.add(match[1]);
-    }
-  }
 
   // BF-YYYY-NNNN format
   const bfPattern = /\b(BF[-\s]?\d{4}[-\s]?\d{4})\b/gi;
+  let match;
   while ((match = bfPattern.exec(text)) !== null) {
-    loanNumbers.add(match[1].replace(/[-\s]/g, ''));
+    const normalized = match[1].replace(/[-\s]/g, '');
+    loanNumbers.add(`BF-${normalized.substring(2, 6)}-${normalized.substring(6)}`);
+  }
+
+  // Numeric loan numbers with context (5-10 digits)
+  // e.g., "loan number 399536679", "file 5260113979", "Loan number 399536679"
+  const numPattern = /\b(?:loans?|deals?|files?|documents?)\s*(?:number|#|no\.?|num\.?)?\s*:?\s*[-–]?\s*(\d{5,10})\b/gi;
+  while ((match = numPattern.exec(text)) !== null) {
+    loanNumbers.add(match[1]);
+  }
+
+  // Servicer loan numbers in subject (7-10 digits after separator)
+  // e.g., "RECORDED DOCUMENTS - 399558497", "Raikin/5260113979"
+  const subjectPattern = /(?:[-–|/]\s*)(\d{7,10})\b/g;
+  while ((match = subjectPattern.exec(subject)) !== null) {
+    loanNumbers.add(match[1]);
   }
 
   return [...loanNumbers];
 }
 
-function extractAddresses(text) {
-  const pattern = /\b\d+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+(?:St(?:reet)?|Ave(?:nue)?|Rd|Road|Dr|Drive|Ln|Lane|Blvd|Boulevard|Ct|Court|Way|Pl|Place)\.?(?:\s*,?\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)?(?:\s*,?\s*[A-Z]{2})?\b/gi;
+function cleanAddress(raw) {
+  if (!raw) return null;
+  let addr = raw.split('\n')[0].split('\r')[0].trim();
+  addr = addr.replace(/[.\s]+$/, '').trim();
+  if (addr.length < 6) return null;
+  if (ADDRESS_BLACKLIST.some(p => p.test(addr))) return null;
+  return addr;
+}
+
+function extractAddresses(subject, body) {
   const addresses = new Set();
-  let match;
-  while ((match = pattern.exec(text)) !== null) {
-    addresses.add(match[0].trim());
+  const addrPattern = /\b(\d{1,6}\s+(?:[A-Za-z]{2,}\.?\s+){1,4}(?:St(?:reet)?|Ave(?:nue)?|Rd|Road|Dr(?:ive)?|Ln|Lane|Blvd|Boulevard|Ct|Court|Way|Pl(?:ace)?|Cir(?:cle)?|Pkwy|Parkway|Ter(?:race)?|Trl|Trail|Hwy|Highway)\.?)(?:[\s,]+(?:(?:Apt|Suite|Ste|Unit|#)\.?\s*[A-Za-z0-9-]+))?(?:\s*,\s*([A-Za-z]+(?:\s+[A-Za-z]+)*)\s*,?\s*([A-Z]{2}))?(?:\s+(\d{5}(?:-\d{4})?))?/g;
+
+  // Process body line by line to prevent cross-line matching
+  for (const line of body.split('\n')) {
+    const cleanLine = line.trim();
+    if (!cleanLine) continue;
+    let match;
+    while ((match = addrPattern.exec(cleanLine)) !== null) {
+      const addr = cleanAddress(match[0]);
+      if (addr) addresses.add(addr);
+    }
   }
+
+  // Check subject line
+  let match;
+  while ((match = addrPattern.exec(subject)) !== null) {
+    const addr = cleanAddress(match[0]);
+    if (addr) addresses.add(addr);
+  }
+
+  // Extract address from subject separators (e.g., "Title Work | 708 Pallister, Detroit, MI")
+  const subjectAddrMatch = subject.match(/[|:–-]\s*(\d{1,6}\s+[A-Za-z][\w\s]+?(?:,\s*[A-Za-z]+(?:\s+[A-Za-z]+)*)?(?:,\s*[A-Z]{2})?(?:\s+\d{5})?)\s*$/);
+  if (subjectAddrMatch) {
+    const addr = cleanAddress(subjectAddrMatch[1]);
+    if (addr && addr.length > 5) addresses.add(addr);
+  }
+
   return [...addresses];
 }
 
-function extractDealNames(text) {
-  const pattern = /\b(?:property|loan|deal)\s+(?:at|on|for|located at)\s+([^,\n]+)/gi;
+function extractDealNames(subject, body) {
   const names = new Set();
+
+  // Subject line patterns: "Draw 6 - 168 Las Palmas", "PAYMENTS: 21 Valley Rd"
+  const subjectPattern = /(?:draw\s*\d*\s*[-–]\s*|payments?:\s*|title\s+work\s*[|]\s*|desktop\s+for\s+)(.+?)(?:\s*[-–|]\s*|$)/gi;
   let match;
-  while ((match = pattern.exec(text)) !== null) {
-    names.add(match[1].trim());
+  while ((match = subjectPattern.exec(subject)) !== null) {
+    const name = match[1].trim();
+    if (name.length >= 3 && name.length <= 80) names.add(name);
   }
+
+  // Property references in body
+  const text = `${subject}\n${body}`;
+  const refPattern = /\b(?:property|loan|deal)\s+(?:at|on|for|located at)\s+(.+?)(?:\s+(?:has|have|was|were|is|will|shall|can|should|and|but|or|which|that)\b|[,.\n]|$)/gi;
+  while ((match = refPattern.exec(text)) !== null) {
+    const name = match[1].trim();
+    if (name.length >= 3 && name.length <= 60 && !name.includes('\n')) names.add(name);
+  }
+
   return [...names];
 }
 
 // --- Deal matching ---
 
 function isTargetStage(deal) {
-  return Object.values(TARGET_STAGES).includes(deal.properties.dealstage);
+  return TARGET_STAGE_VALUES.has(deal.properties.dealstage);
+}
+
+function cleanSearchValue(value) {
+  if (!value) return '';
+  return value.split('\n')[0].split('\r')[0].replace(/\s+/g, ' ').replace(/[.]+$/, '').trim();
+}
+
+function extractStreetCore(address) {
+  const beforeComma = address.split(',')[0].trim();
+  const withoutSuffix = beforeComma.replace(
+    /\s+(?:St(?:reet)?|Ave(?:nue)?|Rd|Road|Dr(?:ive)?|Ln|Lane|Blvd|Boulevard|Ct|Court|Way|Pl(?:ace)?|Cir(?:cle)?|Pkwy|Ter(?:race)?|Trl|Hwy)\.?\s*$/i,
+    ''
+  ).trim();
+  if (/^\d+\s+\w+/.test(withoutSuffix)) return withoutSuffix;
+  return beforeComma;
 }
 
 function scoreMatch(matchType, matchValue, deal, parsed) {
   let score = 0;
+  const cleanMatch = (matchValue || '').split('\n')[0].trim().toLowerCase();
 
   if (matchType === 'loan_number') {
     score = 100;
   } else if (matchType === 'deal_name') {
-    score = 90;
-    const dealName = deal.properties.dealname || '';
-    if (dealName.toLowerCase() === matchValue.toLowerCase()) score = 95;
+    score = 85;
+    const dealName = (deal.properties.dealname || '').toLowerCase();
+    if (dealName === cleanMatch) score = 95;
+    else if (dealName.includes(cleanMatch)) score = 90;
   } else if (matchType === 'address') {
-    score = 75;
-    if (matchValue.length > 30) score += 5;
-    const fullAddress = deal.properties.full_address || '';
-    if (fullAddress.toLowerCase().includes(matchValue.toLowerCase())) score += 5;
+    score = 80;
+    const fullAddress = (deal.properties.full_address || '').toLowerCase();
+    const dealName = (deal.properties.dealname || '').toLowerCase();
+    const streetNum = cleanMatch.match(/^(\d+)/);
+    if (streetNum && (fullAddress.includes(streetNum[1]) || dealName.includes(streetNum[1]))) {
+      score += 5;
+    }
+    if (cleanMatch.length > 25) score += 5;
   }
 
   // Bonus for multiple identifier matches
@@ -181,13 +262,17 @@ async function getEmail(apiKey, emailId) {
   return hubspotRequest(apiKey, `/crm/v3/objects/emails/${emailId}?properties=hs_email_subject,hs_email_text,hs_email_html,hs_timestamp`);
 }
 
-async function searchDealsByLoanNumber(apiKey, loanNumber, useServicerProperty = false) {
-  const propertyName = useServicerProperty ? 'loan_number__servicer_' : 'loan_number';
+async function searchDealsByLoanNumber(apiKey, loanNumber) {
+  // Search across loan_number, servicer A-piece, and servicer B-piece fields
   const data = await hubspotRequest(apiKey, '/crm/v3/objects/deals/search', {
     method: 'POST',
     body: JSON.stringify({
-      filterGroups: [{ filters: [{ propertyName, operator: 'CONTAINS_TOKEN', value: loanNumber }] }],
-      properties: ['loan_number', 'loan_number__servicer_', 'dealname', 'dealstage', 'full_address'],
+      filterGroups: [
+        { filters: [{ propertyName: 'loan_number', operator: 'CONTAINS_TOKEN', value: loanNumber }] },
+        { filters: [{ propertyName: 'loan_number__servicer_', operator: 'CONTAINS_TOKEN', value: loanNumber }] },
+        { filters: [{ propertyName: 'loan_number__b_piece_servicer_', operator: 'CONTAINS_TOKEN', value: loanNumber }] },
+      ],
+      properties: ['loan_number', 'loan_number__servicer_', 'loan_number__b_piece_servicer_', 'dealname', 'dealstage', 'full_address'],
       limit: 20
     })
   });
@@ -252,29 +337,39 @@ async function findMatch(apiKey, parsed) {
   // 1. Search by loan number (highest priority, 100% confidence)
   if (parsed.loanNumbers.length > 0) {
     for (const ln of parsed.loanNumbers) {
-      const deals = await searchDealsByLoanNumber(apiKey, ln, parsed.hasServicer);
+      const deals = await searchDealsByLoanNumber(apiKey, ln);
       const targetDeals = deals.filter(isTargetStage);
       if (targetDeals.length > 0) {
-        // Loan number = 100% confidence, return immediately
         return { deal: targetDeals[0], confidence: 100, matchType: 'loan_number' };
       }
     }
   }
 
-  // 2. Search by deal name (95% for exact match)
+  // 2. Search by deal name, with fallback to full_address
   if (parsed.dealNames.length > 0) {
     for (const name of parsed.dealNames) {
+      const cleanName = cleanSearchValue(name);
+      if (!cleanName || cleanName.length < 3) continue;
       await sleep(150);
-      const deals = await searchDealsByField(apiKey, 'dealname', name);
-      candidates.push(...deals.map(d => ({ deal: d, matchType: 'deal_name', matchValue: name })));
+      let deals = await searchDealsByField(apiKey, 'dealname', cleanName);
+      if (deals.length === 0) {
+        deals = await searchDealsByField(apiKey, 'full_address', cleanName);
+      }
+      candidates.push(...deals.map(d => ({ deal: d, matchType: 'deal_name', matchValue: cleanName })));
     }
   }
 
-  // 3. Search by address
+  // 3. Search by address, with fallback to dealname
   if (parsed.addresses.length > 0) {
     for (const addr of parsed.addresses) {
+      const cleanAddr = cleanSearchValue(addr);
+      if (!cleanAddr || cleanAddr.length < 5) continue;
+      const streetPart = extractStreetCore(cleanAddr);
       await sleep(150);
-      const deals = await searchDealsByField(apiKey, 'full_address', addr);
+      let deals = await searchDealsByField(apiKey, 'full_address', streetPart || cleanAddr);
+      if (deals.length === 0) {
+        deals = await searchDealsByField(apiKey, 'dealname', streetPart || cleanAddr);
+      }
       candidates.push(...deals.map(d => ({ deal: d, matchType: 'address', matchValue: addr })));
     }
   }
