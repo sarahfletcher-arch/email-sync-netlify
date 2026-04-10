@@ -19,3 +19,8 @@
   from = "/webhooks/feasibility-summary"
   to = "/.netlify/functions/feasibility-summary-background"
   status = 200
+
+[[redirects]]
+  from = "/webhooks/remote-control"
+  to = "/.netlify/functions/remote-control"
+  status = 200

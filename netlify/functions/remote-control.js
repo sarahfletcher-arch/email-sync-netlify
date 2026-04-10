@@ -1,0 +1,591 @@
+/**
+ * Netlify Function: Remote Control
+ * Administrative API for the email sync system.
+ *
+ * Actions:
+ *   health-check    – Verify HubSpot API connectivity and system status
+ *   test-parse      – Parse a subject/body and return extracted identifiers
+ *   dry-run         – Fetch a real email by ID, parse it, find a match (no association)
+ *   process-email   – Fetch a real email by ID, parse, match, and associate
+ *   search-deals    – Search HubSpot deals by loan_number, dealname, or full_address
+ *
+ * Auth: Requires X-API-Key header matching REMOTE_CONTROL_KEY env var.
+ *       If REMOTE_CONTROL_KEY is not set, the endpoint is disabled.
+ */
+
+import fetch from 'node-fetch';
+
+const HUBSPOT_API_BASE = 'https://api.hubapi.com';
+
+// --- Shared helpers (duplicated from email-sync.js to keep functions independent) ---
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function hubspotRequest(apiKey, endpoint, options = {}, retries = 3) {
+  const url = `${HUBSPOT_API_BASE}${endpoint}`;
+  const headers = {
+    'Authorization': `Bearer ${apiKey}`,
+    'Content-Type': 'application/json',
+    ...options.headers
+  };
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const response = await fetch(url, { ...options, headers });
+
+      if (response.status === 429) {
+        if (attempt < retries) {
+          const retryAfter = response.headers.get('retry-after');
+          const delay = retryAfter ? parseInt(retryAfter) * 1000 : (attempt + 1) * 1000;
+          await sleep(delay);
+          continue;
+        }
+      }
+
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(`HubSpot API Error (${response.status}): ${error.message || response.statusText}`);
+      }
+
+      if (response.status === 204) return {};
+      return await response.json();
+    } catch (error) {
+      if (attempt < retries && error.message?.includes('secondly limit')) {
+        await sleep((attempt + 1) * 1000);
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
+// --- Target deal stages ---
+
+const TARGET_STAGE_VALUES = new Set([
+  'presentationscheduled', 'closedwon', '4447566', '4447567',
+  '1085330955', '1067972413', '1067972416', '1269293461',
+  '1015819060', '1015819061', '1018320194', '1018320195',
+  '1015819063', '1018320196', '1018320197',
+]);
+
+const ADDRESS_BLACKLIST = [
+  /^\d+\s+(am|pm|quick|other|of\b)/i,
+  /bankruptcy|unsubscribe|copyright/i,
+  /^\d+\s+\w+\s+to\s+get\s+started/i,
+];
+
+const CONFIDENCE_THRESHOLD = 65;
+
+// --- Email parser ---
+
+function parseEmail(subject, body) {
+  const cleanSubject = (subject || '').trim();
+  const cleanBody = (body || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  return {
+    loanNumbers: extractLoanNumbers(cleanSubject, cleanBody),
+    addresses: extractAddresses(cleanSubject, cleanBody),
+    dealNames: extractDealNames(cleanSubject, cleanBody),
+  };
+}
+
+function extractLoanNumbers(subject, body) {
+  const text = `${subject}\n${body}`;
+  const loanNumbers = new Set();
+
+  const bfPattern = /\b(BF[-\s]?\d{4}[-\s]?\d{4})\b/gi;
+  let match;
+  while ((match = bfPattern.exec(text)) !== null) {
+    const normalized = match[1].replace(/[-\s]/g, '');
+    loanNumbers.add(`BF-${normalized.substring(2, 6)}-${normalized.substring(6)}`);
+  }
+
+  const numPattern = /\b(?:loans?|deals?|files?|documents?)\s*(?:number|#|no\.?|num\.?)?\s*:?\s*[-–]?\s*(\d{5,10})\b/gi;
+  while ((match = numPattern.exec(text)) !== null) {
+    loanNumbers.add(match[1]);
+  }
+
+  const subjectPattern = /(?:[-–|/]\s*)(\d{7,10})\b/g;
+  while ((match = subjectPattern.exec(subject)) !== null) {
+    loanNumbers.add(match[1]);
+  }
+
+  return [...loanNumbers];
+}
+
+function cleanAddress(raw) {
+  if (!raw) return null;
+  let addr = raw.split('\n')[0].split('\r')[0].trim();
+  addr = addr.replace(/[.\s]+$/, '').trim();
+  if (addr.length < 6) return null;
+  if (ADDRESS_BLACKLIST.some(p => p.test(addr))) return null;
+  return addr;
+}
+
+function extractAddresses(subject, body) {
+  const addresses = new Set();
+  const addrPattern = /\b(\d{1,6}\s+(?:[A-Za-z]{2,}\.?\s+){1,4}(?:St(?:reet)?|Ave(?:nue)?|Rd|Road|Dr(?:ive)?|Ln|Lane|Blvd|Boulevard|Ct|Court|Way|Pl(?:ace)?|Cir(?:cle)?|Pkwy|Parkway|Ter(?:race)?|Trl|Trail|Hwy|Highway)\.?)(?:[\s,]+(?:(?:Apt|Suite|Ste|Unit|#)\.?\s*[A-Za-z0-9-]+))?(?:\s*,\s*([A-Za-z]+(?:\s+[A-Za-z]+)*)\s*,?\s*([A-Z]{2}))?(?:\s+(\d{5}(?:-\d{4})?))?/g;
+
+  for (const line of body.split('\n')) {
+    const cleanLine = line.trim();
+    if (!cleanLine) continue;
+    let match;
+    while ((match = addrPattern.exec(cleanLine)) !== null) {
+      const addr = cleanAddress(match[0]);
+      if (addr) addresses.add(addr);
+    }
+  }
+
+  let match;
+  while ((match = addrPattern.exec(subject)) !== null) {
+    const addr = cleanAddress(match[0]);
+    if (addr) addresses.add(addr);
+  }
+
+  const subjectAddrMatch = subject.match(/[|:–-]\s*(\d{1,6}\s+[A-Za-z][\w\s]+?(?:,\s*[A-Za-z]+(?:\s+[A-Za-z]+)*)?(?:,\s*[A-Z]{2})?(?:\s+\d{5})?)\s*$/);
+  if (subjectAddrMatch) {
+    const addr = cleanAddress(subjectAddrMatch[1]);
+    if (addr && addr.length > 5) addresses.add(addr);
+  }
+
+  return [...addresses];
+}
+
+function extractDealNames(subject, body) {
+  const names = new Set();
+
+  const subjectPattern = /(?:draw\s*\d*\s*[-–]\s*|payments?:\s*|title\s+work\s*[|]\s*|desktop\s+for\s+)(.+?)(?:\s*[-–|]\s*|$)/gi;
+  let match;
+  while ((match = subjectPattern.exec(subject)) !== null) {
+    const name = match[1].trim();
+    if (name.length >= 3 && name.length <= 80) names.add(name);
+  }
+
+  const text = `${subject}\n${body}`;
+  const refPattern = /\b(?:property|loan|deal)\s+(?:at|on|for|located at)\s+(.+?)(?:\s+(?:has|have|was|were|is|will|shall|can|should|and|but|or|which|that)\b|[,.\n]|$)/gi;
+  while ((match = refPattern.exec(text)) !== null) {
+    const name = match[1].trim();
+    if (name.length >= 3 && name.length <= 60 && !name.includes('\n')) names.add(name);
+  }
+
+  return [...names];
+}
+
+// --- Deal matching ---
+
+function isTargetStage(deal) {
+  return TARGET_STAGE_VALUES.has(deal.properties.dealstage);
+}
+
+function cleanSearchValue(value) {
+  if (!value) return '';
+  return value.split('\n')[0].split('\r')[0].replace(/\s+/g, ' ').replace(/[.]+$/, '').trim();
+}
+
+function extractStreetCore(address) {
+  const beforeComma = address.split(',')[0].trim();
+  const withoutSuffix = beforeComma.replace(
+    /\s+(?:St(?:reet)?|Ave(?:nue)?|Rd|Road|Dr(?:ive)?|Ln|Lane|Blvd|Boulevard|Ct|Court|Way|Pl(?:ace)?|Cir(?:cle)?|Pkwy|Ter(?:race)?|Trl|Hwy)\.?\s*$/i,
+    ''
+  ).trim();
+  if (/^\d+\s+\w+/.test(withoutSuffix)) return withoutSuffix;
+  return beforeComma;
+}
+
+function scoreMatch(matchType, matchValue, deal, parsed) {
+  let score = 0;
+  const cleanMatch = (matchValue || '').split('\n')[0].trim().toLowerCase();
+
+  if (matchType === 'loan_number') {
+    score = 100;
+  } else if (matchType === 'deal_name') {
+    score = 85;
+    const dealName = (deal.properties.dealname || '').toLowerCase();
+    if (dealName === cleanMatch) score = 95;
+    else if (dealName.includes(cleanMatch)) score = 90;
+  } else if (matchType === 'address') {
+    score = 80;
+    const fullAddress = (deal.properties.full_address || '').toLowerCase();
+    const dealName = (deal.properties.dealname || '').toLowerCase();
+    const streetNum = cleanMatch.match(/^(\d+)/);
+    if (streetNum && (fullAddress.includes(streetNum[1]) || dealName.includes(streetNum[1]))) {
+      score += 5;
+    }
+    if (cleanMatch.length > 25) score += 5;
+  }
+
+  const loanNumber = deal.properties.loan_number || '';
+  const dealName = deal.properties.dealname || '';
+  const fullAddress = deal.properties.full_address || '';
+  let matchCount = 0;
+
+  if (parsed.loanNumbers.some(ln => loanNumber.toLowerCase().includes(ln.toLowerCase()))) matchCount++;
+  if (parsed.dealNames.some(dn => dealName.toLowerCase().includes(dn.toLowerCase()))) matchCount++;
+  if (parsed.addresses.some(addr => fullAddress.toLowerCase().includes(addr.toLowerCase()))) matchCount++;
+
+  if (matchCount > 1) score += (matchCount - 1) * 10;
+
+  return Math.min(score, 100);
+}
+
+// --- HubSpot API calls ---
+
+async function getEmail(apiKey, emailId) {
+  return hubspotRequest(apiKey, `/crm/v3/objects/emails/${emailId}?properties=hs_email_subject,hs_email_text,hs_email_html,hs_timestamp`);
+}
+
+async function searchDealsByLoanNumber(apiKey, loanNumber) {
+  const data = await hubspotRequest(apiKey, '/crm/v3/objects/deals/search', {
+    method: 'POST',
+    body: JSON.stringify({
+      filterGroups: [
+        { filters: [{ propertyName: 'loan_number', operator: 'CONTAINS_TOKEN', value: loanNumber }] },
+        { filters: [{ propertyName: 'loan_number__servicer_', operator: 'CONTAINS_TOKEN', value: loanNumber }] },
+        { filters: [{ propertyName: 'loan_number__b_piece_servicer_', operator: 'CONTAINS_TOKEN', value: loanNumber }] },
+      ],
+      properties: ['loan_number', 'loan_number__servicer_', 'loan_number__b_piece_servicer_', 'dealname', 'dealstage', 'full_address'],
+      limit: 20
+    })
+  });
+  return data.results || [];
+}
+
+async function searchDealsByField(apiKey, fieldName, value) {
+  const data = await hubspotRequest(apiKey, '/crm/v3/objects/deals/search', {
+    method: 'POST',
+    body: JSON.stringify({
+      filterGroups: [{ filters: [{ propertyName: fieldName, operator: 'CONTAINS_TOKEN', value }] }],
+      properties: ['dealname', 'loan_number', 'full_address', 'dealstage'],
+      limit: 20
+    })
+  });
+  return data.results || [];
+}
+
+async function getEmailContactAssociations(apiKey, emailId) {
+  try {
+    const data = await hubspotRequest(apiKey, `/crm/v4/objects/emails/${emailId}/associations/contacts`);
+    return data.results || [];
+  } catch (error) {
+    if (error.message.includes('404')) return [];
+    throw error;
+  }
+}
+
+async function getContactDealAssociations(apiKey, contactId) {
+  try {
+    const data = await hubspotRequest(apiKey, `/crm/v4/objects/contacts/${contactId}/associations/deals`);
+    return data.results || [];
+  } catch (error) {
+    if (error.message.includes('404')) return [];
+    throw error;
+  }
+}
+
+async function batchGetDeals(apiKey, dealIds) {
+  const data = await hubspotRequest(apiKey, '/crm/v3/objects/deals/batch/read', {
+    method: 'POST',
+    body: JSON.stringify({
+      properties: ['dealname', 'loan_number', 'full_address', 'dealstage'],
+      inputs: dealIds.map(id => ({ id }))
+    })
+  });
+  return data.results || [];
+}
+
+async function associateEmailToDeal(apiKey, emailId, dealId) {
+  return hubspotRequest(apiKey, `/crm/v4/objects/emails/${emailId}/associations/deals/${dealId}`, {
+    method: 'PUT',
+    body: JSON.stringify([{ associationCategory: "HUBSPOT_DEFINED", associationTypeId: 210 }])
+  });
+}
+
+// --- Match finding ---
+
+async function findMatch(apiKey, parsed) {
+  const candidates = [];
+
+  if (parsed.loanNumbers.length > 0) {
+    for (const ln of parsed.loanNumbers) {
+      const deals = await searchDealsByLoanNumber(apiKey, ln);
+      const targetDeals = deals.filter(isTargetStage);
+      if (targetDeals.length > 0) {
+        return { deal: targetDeals[0], confidence: 100, matchType: 'loan_number' };
+      }
+    }
+  }
+
+  if (parsed.dealNames.length > 0) {
+    for (const name of parsed.dealNames) {
+      const cleanName = cleanSearchValue(name);
+      if (!cleanName || cleanName.length < 3) continue;
+      await sleep(150);
+      let deals = await searchDealsByField(apiKey, 'dealname', cleanName);
+      if (deals.length === 0) {
+        deals = await searchDealsByField(apiKey, 'full_address', cleanName);
+      }
+      candidates.push(...deals.map(d => ({ deal: d, matchType: 'deal_name', matchValue: cleanName })));
+    }
+  }
+
+  if (parsed.addresses.length > 0) {
+    for (const addr of parsed.addresses) {
+      const cleanAddr = cleanSearchValue(addr);
+      if (!cleanAddr || cleanAddr.length < 5) continue;
+      const streetPart = extractStreetCore(cleanAddr);
+      await sleep(150);
+      let deals = await searchDealsByField(apiKey, 'full_address', streetPart || cleanAddr);
+      if (deals.length === 0) {
+        deals = await searchDealsByField(apiKey, 'dealname', streetPart || cleanAddr);
+      }
+      candidates.push(...deals.map(d => ({ deal: d, matchType: 'address', matchValue: addr })));
+    }
+  }
+
+  const scored = candidates
+    .filter(c => isTargetStage(c.deal))
+    .map(c => ({ ...c, score: scoreMatch(c.matchType, c.matchValue, c.deal, parsed) }))
+    .sort((a, b) => b.score - a.score);
+
+  if (scored.length > 0 && scored[0].score >= CONFIDENCE_THRESHOLD) {
+    return { deal: scored[0].deal, confidence: scored[0].score, matchType: scored[0].matchType };
+  }
+
+  return null;
+}
+
+async function fallbackSingleContactDeal(apiKey, emailId) {
+  try {
+    const contactAssocs = await getEmailContactAssociations(apiKey, emailId);
+    if (contactAssocs.length === 0) return null;
+
+    for (const assoc of contactAssocs) {
+      const contactId = assoc.toObjectId;
+      const dealAssocs = await getContactDealAssociations(apiKey, contactId);
+
+      if (dealAssocs.length === 1) {
+        const deals = await batchGetDeals(apiKey, [dealAssocs[0].toObjectId]);
+        if (deals.length === 1) {
+          return { deal: deals[0], confidence: 100, matchType: 'single_contact_deal' };
+        }
+      }
+    }
+
+    return null;
+  } catch (error) {
+    return null;
+  }
+}
+
+// --- Action handlers ---
+
+async function handleHealthCheck(apiKey) {
+  const start = Date.now();
+  try {
+    await hubspotRequest(apiKey, '/crm/v3/objects/deals?limit=1&properties=dealname');
+    const latency = Date.now() - start;
+    return {
+      status: 'healthy',
+      hubspot: { connected: true, latencyMs: latency },
+      config: {
+        confidenceThreshold: CONFIDENCE_THRESHOLD,
+        targetStages: TARGET_STAGE_VALUES.size,
+      },
+      timestamp: new Date().toISOString(),
+    };
+  } catch (error) {
+    return {
+      status: 'unhealthy',
+      hubspot: { connected: false, error: error.message },
+      timestamp: new Date().toISOString(),
+    };
+  }
+}
+
+function handleTestParse(subject, body) {
+  const parsed = parseEmail(subject, body);
+  return {
+    input: { subject, bodyLength: (body || '').length },
+    parsed,
+    summary: {
+      loanNumbersFound: parsed.loanNumbers.length,
+      addressesFound: parsed.addresses.length,
+      dealNamesFound: parsed.dealNames.length,
+    },
+  };
+}
+
+async function handleDryRun(apiKey, emailId) {
+  const email = await getEmail(apiKey, emailId);
+  const subject = email.properties.hs_email_subject || '';
+  const body = email.properties.hs_email_text || email.properties.hs_email_html || '';
+
+  const parsed = parseEmail(subject, body);
+  let match = await findMatch(apiKey, parsed);
+
+  if (!match) {
+    match = await fallbackSingleContactDeal(apiKey, emailId);
+  }
+
+  return {
+    emailId,
+    subject,
+    parsed,
+    match: match ? {
+      dealId: match.deal.id,
+      dealName: match.deal.properties.dealname,
+      dealStage: match.deal.properties.dealstage,
+      confidence: match.confidence,
+      matchType: match.matchType,
+    } : null,
+    wouldAssociate: match !== null,
+  };
+}
+
+async function handleProcessEmail(apiKey, emailId) {
+  const dryResult = await handleDryRun(apiKey, emailId);
+
+  if (dryResult.match) {
+    await associateEmailToDeal(apiKey, emailId, dryResult.match.dealId);
+    return { ...dryResult, associated: true };
+  }
+
+  return { ...dryResult, associated: false };
+}
+
+async function handleSearchDeals(apiKey, query, field) {
+  const allowedFields = ['loan_number', 'dealname', 'full_address'];
+  if (!allowedFields.includes(field)) {
+    throw new Error(`Invalid field "${field}". Allowed: ${allowedFields.join(', ')}`);
+  }
+
+  let deals;
+  if (field === 'loan_number') {
+    deals = await searchDealsByLoanNumber(apiKey, query);
+  } else {
+    deals = await searchDealsByField(apiKey, field, query);
+  }
+
+  return {
+    query,
+    field,
+    totalResults: deals.length,
+    deals: deals.map(d => ({
+      id: d.id,
+      dealname: d.properties.dealname,
+      loanNumber: d.properties.loan_number,
+      fullAddress: d.properties.full_address,
+      dealstage: d.properties.dealstage,
+      isTargetStage: isTargetStage(d),
+    })),
+  };
+}
+
+// --- Main handler ---
+
+export async function handler(event) {
+  const corsHeaders = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type, X-API-Key',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Content-Type': 'application/json',
+  };
+
+  if (event.httpMethod === 'OPTIONS') {
+    return { statusCode: 204, headers: corsHeaders, body: '' };
+  }
+
+  if (event.httpMethod !== 'POST') {
+    return {
+      statusCode: 405,
+      headers: corsHeaders,
+      body: JSON.stringify({ error: 'Method not allowed. Use POST.' }),
+    };
+  }
+
+  // Auth check
+  const controlKey = process.env.REMOTE_CONTROL_KEY;
+  if (!controlKey) {
+    return {
+      statusCode: 503,
+      headers: corsHeaders,
+      body: JSON.stringify({ error: 'Remote control is disabled. Set REMOTE_CONTROL_KEY env var.' }),
+    };
+  }
+
+  const providedKey = event.headers['x-api-key'] || event.headers['X-API-Key'];
+  if (providedKey !== controlKey) {
+    return {
+      statusCode: 401,
+      headers: corsHeaders,
+      body: JSON.stringify({ error: 'Invalid or missing X-API-Key header.' }),
+    };
+  }
+
+  const apiKey = process.env.HUBSPOT_API_KEY;
+  if (!apiKey) {
+    return {
+      statusCode: 500,
+      headers: corsHeaders,
+      body: JSON.stringify({ error: 'HUBSPOT_API_KEY not configured.' }),
+    };
+  }
+
+  try {
+    const { action, ...params } = JSON.parse(event.body);
+
+    let result;
+    switch (action) {
+      case 'health-check':
+        result = await handleHealthCheck(apiKey);
+        break;
+
+      case 'test-parse':
+        if (!params.subject && !params.body) {
+          throw new Error('Provide at least "subject" or "body".');
+        }
+        result = handleTestParse(params.subject, params.body);
+        break;
+
+      case 'dry-run':
+        if (!params.emailId) throw new Error('"emailId" is required.');
+        result = await handleDryRun(apiKey, params.emailId);
+        break;
+
+      case 'process-email':
+        if (!params.emailId) throw new Error('"emailId" is required.');
+        result = await handleProcessEmail(apiKey, params.emailId);
+        break;
+
+      case 'search-deals':
+        if (!params.query) throw new Error('"query" is required.');
+        if (!params.field) throw new Error('"field" is required (loan_number, dealname, full_address).');
+        result = await handleSearchDeals(apiKey, params.query, params.field);
+        break;
+
+      default:
+        return {
+          statusCode: 400,
+          headers: corsHeaders,
+          body: JSON.stringify({
+            error: `Unknown action "${action}".`,
+            availableActions: ['health-check', 'test-parse', 'dry-run', 'process-email', 'search-deals'],
+          }),
+        };
+    }
+
+    return {
+      statusCode: 200,
+      headers: corsHeaders,
+      body: JSON.stringify({ action, ...result }),
+    };
+  } catch (error) {
+    console.error(`Remote control error: ${error.message}`);
+    return {
+      statusCode: 400,
+      headers: corsHeaders,
+      body: JSON.stringify({ error: error.message }),
+    };
+  }
+}

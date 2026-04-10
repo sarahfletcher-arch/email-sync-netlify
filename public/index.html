@@ -147,6 +147,172 @@
             border: 1px solid #fca5a5;
             display: block;
         }
+
+        .divider {
+            border: none;
+            border-top: 2px solid #e2e8f0;
+            margin: 30px 0;
+        }
+
+        .rc-section {
+            margin-top: 10px;
+        }
+
+        .rc-section h2 {
+            color: #333;
+            font-size: 24px;
+            margin-bottom: 5px;
+        }
+
+        .rc-section .subtitle {
+            margin-bottom: 20px;
+        }
+
+        .rc-auth {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .rc-auth input {
+            flex: 1;
+            padding: 10px 14px;
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 14px;
+            font-family: 'Courier New', monospace;
+        }
+
+        .rc-auth input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .rc-actions {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .rc-actions button {
+            margin: 0;
+            font-size: 14px;
+            padding: 10px 16px;
+        }
+
+        .rc-actions button.secondary {
+            background: #475569;
+        }
+
+        .rc-actions button.secondary:hover {
+            background: #334155;
+        }
+
+        .rc-input-group {
+            margin-bottom: 15px;
+        }
+
+        .rc-input-group label {
+            display: block;
+            color: #475569;
+            font-size: 13px;
+            font-weight: 600;
+            margin-bottom: 5px;
+        }
+
+        .rc-input-group input,
+        .rc-input-group select,
+        .rc-input-group textarea {
+            width: 100%;
+            padding: 10px 14px;
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 14px;
+        }
+
+        .rc-input-group textarea {
+            font-family: inherit;
+            resize: vertical;
+            min-height: 60px;
+        }
+
+        .rc-input-group input:focus,
+        .rc-input-group select:focus,
+        .rc-input-group textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .rc-input-row {
+            display: flex;
+            gap: 10px;
+        }
+
+        .rc-input-row .rc-input-group {
+            flex: 1;
+        }
+
+        .rc-output {
+            background: #1e293b;
+            color: #e2e8f0;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            white-space: pre-wrap;
+            word-break: break-all;
+            max-height: 400px;
+            overflow-y: auto;
+            display: none;
+            margin-top: 15px;
+        }
+
+        .rc-output.visible {
+            display: block;
+        }
+
+        .tab-bar {
+            display: flex;
+            gap: 5px;
+            margin-bottom: 15px;
+            border-bottom: 2px solid #e2e8f0;
+            padding-bottom: 0;
+        }
+
+        .tab-bar button {
+            background: none;
+            color: #64748b;
+            border: none;
+            border-bottom: 2px solid transparent;
+            padding: 8px 16px;
+            font-size: 14px;
+            cursor: pointer;
+            margin: 0 0 -2px 0;
+            border-radius: 0;
+            width: auto;
+            transition: color 0.2s, border-color 0.2s;
+        }
+
+        .tab-bar button:hover {
+            color: #334155;
+            background: none;
+        }
+
+        .tab-bar button.active {
+            color: #667eea;
+            border-bottom-color: #667eea;
+            font-weight: 600;
+            background: none;
+        }
+
+        .tab-panel {
+            display: none;
+        }
+
+        .tab-panel.active {
+            display: block;
+        }
     </style>
 </head>
 <body>
@@ -180,6 +346,77 @@
         <button onclick="testWebhook()">Test Connection</button>
 
         <div id="result"></div>
+
+        <hr class="divider">
+
+        <!-- Remote Control Section -->
+        <div class="rc-section">
+            <h2>Remote Control</h2>
+            <p class="subtitle">Manage and debug the email sync system</p>
+
+            <div class="rc-auth">
+                <input type="password" id="apiKey" placeholder="Enter API Key (REMOTE_CONTROL_KEY)">
+            </div>
+
+            <div class="tab-bar">
+                <button class="active" onclick="switchTab('health')">Health</button>
+                <button onclick="switchTab('parse')">Test Parse</button>
+                <button onclick="switchTab('email')">Email Lookup</button>
+                <button onclick="switchTab('search')">Deal Search</button>
+            </div>
+
+            <!-- Health Check Tab -->
+            <div id="tab-health" class="tab-panel active">
+                <p style="color: #64748b; margin-bottom: 10px;">Verify HubSpot API connectivity and system configuration.</p>
+                <button onclick="rcAction('health-check')">Run Health Check</button>
+            </div>
+
+            <!-- Test Parse Tab -->
+            <div id="tab-parse" class="tab-panel">
+                <div class="rc-input-group">
+                    <label>Email Subject</label>
+                    <input type="text" id="parseSubject" placeholder="e.g. Draw 6 - 168 Las Palmas Ave">
+                </div>
+                <div class="rc-input-group">
+                    <label>Email Body</label>
+                    <textarea id="parseBody" rows="3" placeholder="Paste email body text here..."></textarea>
+                </div>
+                <button onclick="rcAction('test-parse', { subject: val('parseSubject'), body: val('parseBody') })">Parse Email</button>
+            </div>
+
+            <!-- Email Lookup Tab -->
+            <div id="tab-email" class="tab-panel">
+                <div class="rc-input-group">
+                    <label>HubSpot Email ID</label>
+                    <input type="text" id="emailId" placeholder="e.g. 12345678">
+                </div>
+                <div class="rc-actions">
+                    <button class="secondary" onclick="rcAction('dry-run', { emailId: val('emailId') })">Dry Run (no changes)</button>
+                    <button onclick="rcAction('process-email', { emailId: val('emailId') })">Process &amp; Associate</button>
+                </div>
+            </div>
+
+            <!-- Deal Search Tab -->
+            <div id="tab-search" class="tab-panel">
+                <div class="rc-input-row">
+                    <div class="rc-input-group">
+                        <label>Search Query</label>
+                        <input type="text" id="searchQuery" placeholder="e.g. BF-2024-1234">
+                    </div>
+                    <div class="rc-input-group" style="max-width: 180px;">
+                        <label>Field</label>
+                        <select id="searchField">
+                            <option value="loan_number">Loan Number</option>
+                            <option value="dealname">Deal Name</option>
+                            <option value="full_address">Address</option>
+                        </select>
+                    </div>
+                </div>
+                <button onclick="rcAction('search-deals', { query: val('searchQuery'), field: val('searchField') })">Search Deals</button>
+            </div>
+
+            <div id="rcOutput" class="rc-output"></div>
+        </div>
     </div>
 
     <script>
@@ -213,6 +450,49 @@
                     <strong>✗ Connection Failed</strong><br>
                     ${error.message}
                 `;
+            }
+        }
+
+        // --- Remote Control ---
+
+        function val(id) {
+            return document.getElementById(id).value;
+        }
+
+        function switchTab(name) {
+            document.querySelectorAll('.tab-bar button').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+            document.getElementById('tab-' + name).classList.add('active');
+            event.target.classList.add('active');
+        }
+
+        async function rcAction(action, params) {
+            const key = document.getElementById('apiKey').value;
+            const output = document.getElementById('rcOutput');
+
+            if (!key) {
+                output.textContent = 'Error: Enter your API Key first.';
+                output.classList.add('visible');
+                return;
+            }
+
+            output.textContent = 'Running ' + action + '...';
+            output.classList.add('visible');
+
+            try {
+                const response = await fetch('/webhooks/remote-control', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-API-Key': key,
+                    },
+                    body: JSON.stringify({ action, ...params }),
+                });
+
+                const data = await response.json();
+                output.textContent = JSON.stringify(data, null, 2);
+            } catch (error) {
+                output.textContent = 'Error: ' + error.message;
             }
         }
     </script>
